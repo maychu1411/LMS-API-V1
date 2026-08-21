@@ -15,56 +15,51 @@ const jparse = (v, fallback=[]) => { try{return typeof v==='string'?JSON.parse(v
 function toast(message,type='ok'){ const el=$('#toast'); el.textContent=message; el.hidden=false; el.className='toast'+(type==='error'?' error':''); clearTimeout(window.__toast); window.__toast=setTimeout(()=>el.hidden=true,2600); }
 function setBusy(v){state.busy=v; document.querySelectorAll('[data-busy]').forEach(b=>b.disabled=v)}
 function saveSession(){ if(state.token)localStorage.setItem('lms_token',state.token); else localStorage.removeItem('lms_token'); if(state.user)localStorage.setItem('lms_user',JSON.stringify(state.user)); else localStorage.removeItem('lms_user'); }
-// Bridge GitHub -> Apps Script V1.2: POST form ẩn, không dùng fetch/CORS.
-const BRIDGE_CHANNEL='lms-gas-form-v2';
-const bridgePending=new Map();
-window.addEventListener('message',(ev)=>{
-  const m=ev.data||{};
-  if(m.channel!==BRIDGE_CHANNEL || !m.id || !bridgePending.has(m.id)) return;
-  const q=bridgePending.get(m.id); bridgePending.delete(m.id);
-  q.cleanup();
-  q.resolve(m.result);
-});
-function bridgeCall(payload){
+// Transport GitHub -> Apps Script V1.3.
+// Gửi bằng POST no-cors (không đọc trực tiếp response), sau đó lấy kết quả bằng JSONP có khóa ngẫu nhiên.
+const JSONP_POLL_MS=350;
+const RPC_TIMEOUT_MS=45000;
+function randomHex(bytes=16){
+  const a=new Uint8Array(bytes);
+  if(window.crypto&&crypto.getRandomValues)crypto.getRandomValues(a);else for(let i=0;i<a.length;i++)a[i]=Math.floor(Math.random()*256);
+  return Array.from(a,x=>x.toString(16).padStart(2,'0')).join('');
+}
+function jsonpPoll(requestId,responseKey){
   return new Promise((resolve,reject)=>{
-    if(!API || API.includes('PASTE_')){reject(new Error('Chưa cấu hình URL Apps Script trong config.js'));return;}
-    const id='rpc_'+Date.now()+'_'+Math.random().toString(36).slice(2);
-    const frameName='lms_bridge_'+id.replace(/[^a-zA-Z0-9_]/g,'');
-    const iframe=document.createElement('iframe');
-    iframe.name=frameName;
-    iframe.setAttribute('aria-hidden','true');
-    iframe.tabIndex=-1;
-    iframe.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;border:0;left:-9999px;top:-9999px';
-    document.body.appendChild(iframe);
-
-    const form=document.createElement('form');
-    form.method='POST';
-    form.action=API;
-    form.target=frameName;
-    form.style.display='none';
-    const add=(name,value)=>{const i=document.createElement('input');i.type='hidden';i.name=name;i.value=value;form.appendChild(i)};
-    add('bridge','1');
-    add('requestId',id);
-    add('payload',JSON.stringify(payload));
-    document.body.appendChild(form);
-
-    const cleanup=()=>{try{form.remove()}catch{};try{iframe.remove()}catch{};clearTimeout(timer)};
-    const timer=setTimeout(()=>{
-      if(bridgePending.has(id)) bridgePending.delete(id);
-      cleanup();
-      reject(new Error('Máy chủ phản hồi quá lâu. Kiểm tra phiên bản Apps Script V1.2.'));
-    },30000);
-    bridgePending.set(id,{resolve,reject,cleanup});
-    try{form.submit();setTimeout(()=>{try{form.remove()}catch{}},1000)}catch(err){bridgePending.delete(id);cleanup();reject(err)}
+    const cb='__lmscb_'+randomHex(8);
+    const script=document.createElement('script');
+    let done=false;
+    const clean=()=>{try{delete window[cb]}catch{};try{script.remove()}catch{}};
+    window[cb]=(data)=>{done=true;clean();resolve(data||{ready:false});};
+    script.onerror=()=>{if(done)return;clean();reject(new Error('Không đọc được phản hồi từ Apps Script.'));};
+    script.src=API+(API.includes('?')?'&':'?')+'jsonp=1&requestId='+encodeURIComponent(requestId)+'&responseKey='+encodeURIComponent(responseKey)+'&callback='+encodeURIComponent(cb)+'&_='+Date.now();
+    document.head.appendChild(script);
   });
 }
+async function bridgeCall(payload){
+  if(!API||API.includes('PASTE_'))throw new Error('Chưa cấu hình URL Apps Script trong config.js');
+  const requestId='r'+Date.now().toString(36)+randomHex(8);
+  const responseKey=randomHex(20);
+  const envelope={transport:'async-v13',requestId,responseKey,payload};
+  // Không await response body vì cross-origin; server vẫn nhận và xử lý POST.
+  fetch(API,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify(envelope),cache:'no-store',redirect:'follow'}).catch(()=>{});
+  const started=Date.now();
+  while(Date.now()-started<RPC_TIMEOUT_MS){
+    await new Promise(r=>setTimeout(r,JSONP_POLL_MS));
+    try{
+      const p=await jsonpPoll(requestId,responseKey);
+      if(p&&p.ready)return p.result;
+    }catch(e){/* thử lại cho đến timeout */}
+  }
+  throw new Error('Máy chủ chưa trả kết quả sau 45 giây.');
+}
 async function rpc(action,data={}){
-  if(!API || API.includes('PASTE_')) throw new Error('Chưa cấu hình URL Apps Script trong config.js');
-  let out;
-  try{out=await bridgeCall({action,token:state.token,...data});}
-  catch(e){throw new Error(e.message||'Không kết nối được máy chủ.');}
-  if(!out || typeof out!=='object') throw new Error('Máy chủ trả dữ liệu không hợp lệ.');
-  if(!out.success){ if(out.code==='SESSION_EXPIRED'){state.token='';state.user=null;saveSession();renderLogin();} throw new Error(out.message||'Có lỗi xảy ra'); }
+  const out=await bridgeCall({action,token:state.token,...data});
+  if(!out||typeof out!=='object')throw new Error('Máy chủ trả dữ liệu không hợp lệ.');
+  if(!out.success){
+    if(out.code==='SESSION_EXPIRED'){state.token='';state.user=null;saveSession();renderLogin();}
+    throw new Error(out.message||'Có lỗi xảy ra');
+  }
   return out.data;
 }
 function roleLabel(r){return r==='admin'?'Admin':r==='teacher'?'Giáo viên':'Học sinh'}
@@ -120,7 +115,7 @@ function teacherGroup(){const groups={};cd().students.forEach(s=>{const g=s.grou
 function teacherReport(){const sorted=[...cd().students].sort((a,b)=>(b.points||0)-(a.points||0));return `<div class="card"><div class="section-title"><div><h2>🏆 Bảng Vàng Cá Nhân</h2></div></div><div class="list">${sorted.slice(0,10).map((s,i)=>`<div class="list-item"><div style="display:flex;gap:10px;align-items:center"><span class="pill amber">#${i+1}</span><b>${esc(s.displayName)}</b></div><b style="color:var(--blue)">${s.points||0} đ</b></div>`).join('')}</div></div>`}
 async function openGrading(assignmentId){try{const data=await rpc('submission.listByAssignment',{classId:state.classId,assignmentId});state.selectedAssignment={id:assignmentId,data};renderGradingModal()}catch(e){toast(e.message,'error')}}
 function renderGradingModal(){const a=state.selectedAssignment.data;document.body.insertAdjacentHTML('beforeend',`<div class="modal-backdrop" id="modal"><div class="modal wide"><div class="modal-head"><b>Chấm bài: ${esc(a.assignment.title)}</b><button class="close" onclick="closeModal()">×</button></div><div class="grade-layout"><div class="grade-list">${a.items.map(s=>`<button class="list-item" style="width:100%;border-radius:0;border-width:0 0 1px 0" onclick="selectSubmissionForGrade('${s.id}')"><div><b>${esc(s.studentName)}</b><div class="tiny muted">${new Date(s.submittedAt).toLocaleString('vi-VN')}</div></div><span class="pill ${s.status==='reviewed'?'green':'blue'}">${s.status==='reviewed'?'Đã chấm':'Chờ chấm'}</span></button>`).join('')||'<p class="muted center" style="padding:20px">Chưa có bài nộp.</p>'}</div><div id="gradeMain" class="grade-main"><div class="center muted" style="padding:50px">Chọn học sinh để xem bài.</div></div><div id="gradePanel" class="grade-panel"></div></div></div></div>`)}
-async function selectSubmissionForGrade(id){const s=state.selectedAssignment.data.items.find(x=>x.id===id);state.selectedSubmission=s;$('#gradeMain').innerHTML='<div class="skeleton"></div>';try{const files=await rpc('file.getMany',{fileIds:jparse(s.attachmentIds,[]),classId:s.classId,submissionId:s.id});$('#gradeMain').innerHTML=`<div class="file-grid">${files.map(f=>f.mimeType.startsWith('image/')?`<div class="file-preview"><img src="data:${f.mimeType};base64,${f.base64}"></div>`:`<div class="card"><b>${esc(f.name)}</b><p class="small muted">${esc(f.mimeType)}</p></div>`).join('')||'<div class="muted center">Không có ảnh.</div>'}</div>`}catch(e){$('#gradeMain').innerHTML=`<div class="muted">${esc(e.message)}</div>`}$('#gradePanel').innerHTML=`<div class="field"><label>Học sinh</label><b>${esc(s.studentName)}</b></div><div class="field" style="margin-top:14px"><label>Điểm</label><input class="input" id="gradeScore" type="number" step="0.5" min="0" value="${esc(s.score||'')}"></div><div class="field" style="margin-top:12px"><label>Nhận xét</label><textarea class="textarea" id="gradeFeedback">${esc(s.teacherFeedback||'')}</textarea></div><button class="btn btn-primary btn-block" style="margin-top:12px" onclick="saveGrade()">Lưu lời phê</button>`}
+async function selectSubmissionForGrade(id){const s=state.selectedAssignment.data.items.find(x=>x.id===id);state.selectedSubmission=s;$('#gradeMain').innerHTML='<div class="skeleton"></div>';try{const files=await rpc('file.prepareViews',{fileIds:jparse(s.attachmentIds,[]),classId:s.classId,submissionId:s.id});$('#gradeMain').innerHTML=`<div class="file-grid">${files.map(f=>`<div class="file-preview"><iframe src="${esc(f.viewUrl)}" title="${esc(f.name)}" loading="lazy" style="width:100%;min-height:520px;border:0;border-radius:12px;background:#eef2f7"></iframe></div>`).join('')||'<div class="muted center">Không có ảnh.</div>'}</div>`}catch(e){$('#gradeMain').innerHTML=`<div class="muted">${esc(e.message)}</div>`}$('#gradePanel').innerHTML=`<div class="field"><label>Học sinh</label><b>${esc(s.studentName)}</b></div><div class="field" style="margin-top:14px"><label>Điểm</label><input class="input" id="gradeScore" type="number" step="0.5" min="0" value="${esc(s.score||'')}"></div><div class="field" style="margin-top:12px"><label>Nhận xét</label><textarea class="textarea" id="gradeFeedback">${esc(s.teacherFeedback||'')}</textarea></div><button class="btn btn-primary btn-block" style="margin-top:12px" onclick="saveGrade()">Lưu lời phê</button>`}
 async function saveGrade(){const s=state.selectedSubmission;if(!s)return;try{await rpc('submission.grade',{submissionId:s.id,score:$('#gradeScore').value,teacherFeedback:$('#gradeFeedback').value});toast('Đã lưu nhận xét');closeModal();state.data.classData=await rpc('teacher.classData',{classId:state.classId});renderTeacher()}catch(e){toast(e.message,'error')}}
 
 // STUDENT
