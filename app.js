@@ -15,49 +15,47 @@ const jparse = (v, fallback=[]) => { try{return typeof v==='string'?JSON.parse(v
 function toast(message,type='ok'){ const el=$('#toast'); el.textContent=message; el.hidden=false; el.className='toast'+(type==='error'?' error':''); clearTimeout(window.__toast); window.__toast=setTimeout(()=>el.hidden=true,2600); }
 function setBusy(v){state.busy=v; document.querySelectorAll('[data-busy]').forEach(b=>b.disabled=v)}
 function saveSession(){ if(state.token)localStorage.setItem('lms_token',state.token); else localStorage.removeItem('lms_token'); if(state.user)localStorage.setItem('lms_user',JSON.stringify(state.user)); else localStorage.removeItem('lms_user'); }
-// Bridge GitHub -> Apps Script: tránh CORS/fetch cross-origin.
-const BRIDGE_CHANNEL='lms-gas-bridge-v1';
-let bridgeFrame=null, bridgeReady=false, bridgeReadyPromise=null;
+// Bridge GitHub -> Apps Script V1.2: POST form ẩn, không dùng fetch/CORS.
+const BRIDGE_CHANNEL='lms-gas-form-v2';
 const bridgePending=new Map();
-function bridgeUrl(){
-  const u=new URL(API);
-  u.searchParams.set('bridge','1');
-  u.searchParams.set('_v',CFG.CACHE_VERSION||'v1');
-  return u.toString();
-}
-function ensureBridge(){
-  if(bridgeReady) return Promise.resolve();
-  if(bridgeReadyPromise) return bridgeReadyPromise;
-  bridgeReadyPromise=new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(new Error('Không khởi tạo được cầu nối Apps Script. Hãy deploy phiên bản backend mới.')),15000);
-    const onMessage=(ev)=>{
-      const m=ev.data||{};
-      if(m.channel!==BRIDGE_CHANNEL) return;
-      if(m.type==='ready'){
-        bridgeReady=true; clearTimeout(timer); resolve(); return;
-      }
-      if(m.id && bridgePending.has(m.id)){
-        const q=bridgePending.get(m.id); bridgePending.delete(m.id);
-        if(m.error) q.reject(new Error(m.error)); else q.resolve(m.result);
-      }
-    };
-    window.addEventListener('message',onMessage);
-    bridgeFrame=document.createElement('iframe');
-    bridgeFrame.src=bridgeUrl();
-    bridgeFrame.setAttribute('aria-hidden','true');
-    bridgeFrame.tabIndex=-1;
-    bridgeFrame.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;border:0;left:-9999px;top:-9999px';
-    document.body.appendChild(bridgeFrame);
-  });
-  return bridgeReadyPromise;
-}
-async function bridgeCall(payload){
-  await ensureBridge();
-  const id='rpc_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+window.addEventListener('message',(ev)=>{
+  const m=ev.data||{};
+  if(m.channel!==BRIDGE_CHANNEL || !m.id || !bridgePending.has(m.id)) return;
+  const q=bridgePending.get(m.id); bridgePending.delete(m.id);
+  q.cleanup();
+  q.resolve(m.result);
+});
+function bridgeCall(payload){
   return new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{bridgePending.delete(id);reject(new Error('Máy chủ phản hồi quá lâu. Vui lòng thử lại.'));},30000);
-    bridgePending.set(id,{resolve:(v)=>{clearTimeout(timer);resolve(v)},reject:(e)=>{clearTimeout(timer);reject(e)}});
-    bridgeFrame.contentWindow.postMessage({channel:BRIDGE_CHANNEL,id,payload},'*');
+    if(!API || API.includes('PASTE_')){reject(new Error('Chưa cấu hình URL Apps Script trong config.js'));return;}
+    const id='rpc_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+    const frameName='lms_bridge_'+id.replace(/[^a-zA-Z0-9_]/g,'');
+    const iframe=document.createElement('iframe');
+    iframe.name=frameName;
+    iframe.setAttribute('aria-hidden','true');
+    iframe.tabIndex=-1;
+    iframe.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;border:0;left:-9999px;top:-9999px';
+    document.body.appendChild(iframe);
+
+    const form=document.createElement('form');
+    form.method='POST';
+    form.action=API;
+    form.target=frameName;
+    form.style.display='none';
+    const add=(name,value)=>{const i=document.createElement('input');i.type='hidden';i.name=name;i.value=value;form.appendChild(i)};
+    add('bridge','1');
+    add('requestId',id);
+    add('payload',JSON.stringify(payload));
+    document.body.appendChild(form);
+
+    const cleanup=()=>{try{form.remove()}catch{};try{iframe.remove()}catch{};clearTimeout(timer)};
+    const timer=setTimeout(()=>{
+      if(bridgePending.has(id)) bridgePending.delete(id);
+      cleanup();
+      reject(new Error('Máy chủ phản hồi quá lâu. Kiểm tra phiên bản Apps Script V1.2.'));
+    },30000);
+    bridgePending.set(id,{resolve,reject,cleanup});
+    try{form.submit();setTimeout(()=>{try{form.remove()}catch{}},1000)}catch(err){bridgePending.delete(id);cleanup();reject(err)}
   });
 }
 async function rpc(action,data={}){
