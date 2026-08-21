@@ -15,15 +15,57 @@ const jparse = (v, fallback=[]) => { try{return typeof v==='string'?JSON.parse(v
 function toast(message,type='ok'){ const el=$('#toast'); el.textContent=message; el.hidden=false; el.className='toast'+(type==='error'?' error':''); clearTimeout(window.__toast); window.__toast=setTimeout(()=>el.hidden=true,2600); }
 function setBusy(v){state.busy=v; document.querySelectorAll('[data-busy]').forEach(b=>b.disabled=v)}
 function saveSession(){ if(state.token)localStorage.setItem('lms_token',state.token); else localStorage.removeItem('lms_token'); if(state.user)localStorage.setItem('lms_user',JSON.stringify(state.user)); else localStorage.removeItem('lms_user'); }
+// Bridge GitHub -> Apps Script: tránh CORS/fetch cross-origin.
+const BRIDGE_CHANNEL='lms-gas-bridge-v1';
+let bridgeFrame=null, bridgeReady=false, bridgeReadyPromise=null;
+const bridgePending=new Map();
+function bridgeUrl(){
+  const u=new URL(API);
+  u.searchParams.set('bridge','1');
+  u.searchParams.set('_v',CFG.CACHE_VERSION||'v1');
+  return u.toString();
+}
+function ensureBridge(){
+  if(bridgeReady) return Promise.resolve();
+  if(bridgeReadyPromise) return bridgeReadyPromise;
+  bridgeReadyPromise=new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('Không khởi tạo được cầu nối Apps Script. Hãy deploy phiên bản backend mới.')),15000);
+    const onMessage=(ev)=>{
+      const m=ev.data||{};
+      if(m.channel!==BRIDGE_CHANNEL) return;
+      if(m.type==='ready'){
+        bridgeReady=true; clearTimeout(timer); resolve(); return;
+      }
+      if(m.id && bridgePending.has(m.id)){
+        const q=bridgePending.get(m.id); bridgePending.delete(m.id);
+        if(m.error) q.reject(new Error(m.error)); else q.resolve(m.result);
+      }
+    };
+    window.addEventListener('message',onMessage);
+    bridgeFrame=document.createElement('iframe');
+    bridgeFrame.src=bridgeUrl();
+    bridgeFrame.setAttribute('aria-hidden','true');
+    bridgeFrame.tabIndex=-1;
+    bridgeFrame.style.cssText='position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;border:0;left:-9999px;top:-9999px';
+    document.body.appendChild(bridgeFrame);
+  });
+  return bridgeReadyPromise;
+}
+async function bridgeCall(payload){
+  await ensureBridge();
+  const id='rpc_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{bridgePending.delete(id);reject(new Error('Máy chủ phản hồi quá lâu. Vui lòng thử lại.'));},30000);
+    bridgePending.set(id,{resolve:(v)=>{clearTimeout(timer);resolve(v)},reject:(e)=>{clearTimeout(timer);reject(e)}});
+    bridgeFrame.contentWindow.postMessage({channel:BRIDGE_CHANNEL,id,payload},'*');
+  });
+}
 async function rpc(action,data={}){
   if(!API || API.includes('PASTE_')) throw new Error('Chưa cấu hình URL Apps Script trong config.js');
-  const body={action,token:state.token,...data};
-  let res;
-  try{
-    res=await fetch(API,{method:'POST',redirect:'follow',body:JSON.stringify(body)});
-  }catch(e){ throw new Error('Không kết nối được máy chủ. Kiểm tra Deploy Apps Script và URL /exec.'); }
-  const text=await res.text(); let out;
-  try{out=JSON.parse(text)}catch{throw new Error('Máy chủ trả dữ liệu không hợp lệ. Hãy deploy phiên bản Apps Script mới.');}
+  let out;
+  try{out=await bridgeCall({action,token:state.token,...data});}
+  catch(e){throw new Error(e.message||'Không kết nối được máy chủ.');}
+  if(!out || typeof out!=='object') throw new Error('Máy chủ trả dữ liệu không hợp lệ.');
   if(!out.success){ if(out.code==='SESSION_EXPIRED'){state.token='';state.user=null;saveSession();renderLogin();} throw new Error(out.message||'Có lỗi xảy ra'); }
   return out.data;
 }
